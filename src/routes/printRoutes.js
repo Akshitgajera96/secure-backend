@@ -151,6 +151,20 @@ router.post('/print/fetch', authMiddleware, async (req, res) => {
       return res.status(500).json({ message: 'S3 not configured' });
     }
 
+    try {
+      await s3.send(
+        new HeadObjectCommand({
+          Bucket: bucket,
+          Key: sourceKey,
+        })
+      );
+    } catch (err) {
+      console.error('[PRINT_BLOCKED] PDF missing in S3:', sourceKey);
+      return res.status(409).json({
+        message: 'PDF not available for printing. Please regenerate.',
+      });
+    }
+
     const command = new GetObjectCommand({ Bucket: bucket, Key: sourceKey });
     const obj = await s3.send(command);
     if (!obj?.Body) {
