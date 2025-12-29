@@ -26,3 +26,4 @@ EXPOSE 8000
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 CMD ["node", "src/index.js"]
+# force railway rebuild
