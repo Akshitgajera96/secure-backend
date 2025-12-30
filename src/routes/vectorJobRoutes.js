@@ -163,21 +163,25 @@ router.post('/jobs', authMiddleware, requireAdmin, async (req, res) => {
     const printJobId =
       (req._vectorPreallocatedJobId && String(req._vectorPreallocatedJobId)) || new VectorPrintJob()._id.toString();
 
-    const createdAt = new Date();
-    const payloadHmac = signJobHmacPayload({ jobId: String(printJobId), createdAt: createdAt.toISOString() });
-
     const jobDoc = await VectorPrintJob.create({
       _id: printJobId,
       userId: req.user._id,
       sourcePdfKey: metadata.sourcePdfKey,
       metadata,
-      payloadHmac,
+      payloadHmac: crypto.randomBytes(32).toString('hex'),
       status: 'PENDING',
       progress: 0,
       totalPages,
-      createdAt,
       audit: [{ event: 'JOB_CREATED', details: { totalPages } }],
     });
+
+    const payloadHmac = signJobHmacPayload({
+      jobId: jobDoc._id.toString(),
+      createdAt: jobDoc.createdAt.toISOString(),
+    });
+
+    jobDoc.payloadHmac = payloadHmac;
+    await jobDoc.save();
 
     console.log('[HMAC_SIGN]', {
       jobId: jobDoc._id.toString(),
