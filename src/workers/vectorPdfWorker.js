@@ -174,6 +174,8 @@ export const enqueueVectorJobFlow = async ({ printJobId, totalPages }) => {
       opts: {
         attempts: Number(process.env.VECTOR_BATCH_ATTEMPTS || 3),
         backoff: { type: 'exponential', delay: 2000 },
+        // Keep results until parent merge reads them (prevents missing children values)
+        removeOnComplete: false,
       },
     };
   });
@@ -402,6 +404,19 @@ export const processNormalizeSvg = async (job) => {
     ts: Date.now(),
   });
 
+  const claimedDocumentId =
+    typeof job?.data?.documentId === 'string' ? job.data.documentId.trim() : '';
+  if (claimedDocumentId) {
+    const existingDoc = await VectorDocument.findById(claimedDocumentId).catch(() => null);
+    if (existingDoc?.fileKey && existingDoc.fileKey.endsWith('.pdf')) {
+      console.log('[SVG_NORMALIZE_SKIP_ALREADY_PDF]', { documentId: claimedDocumentId });
+      return {
+        skipped: true,
+        fileKey: existingDoc.fileKey,
+      };
+    }
+  }
+
   if (job?.data?.documentId) {
     await VectorDocument.updateOne(
       { _id: job.data.documentId, svgNormalizeStatus: 'PENDING' },
@@ -431,6 +446,7 @@ export const processNormalizeSvg = async (job) => {
   let softTimeoutWarned = false;
   let svgoDurationMs = null;
   let inkscapeDurationMs = null;
+  let timeoutCancelled = false;
 
   const extendTimeoutTo = (nextMaxMs) => {
     const n = Number(nextMaxMs);
@@ -524,6 +540,7 @@ export const processNormalizeSvg = async (job) => {
 
       const rawSvg = await fsPromises.readFile(svgPath, 'utf8');
       const originalBytes = Buffer.byteLength(rawSvg, 'utf8');
+      const svgSizeMb = originalBytes / (1024 * 1024);
 
       const SIZE_10_MB = 10 * 1024 * 1024;
       const SIZE_20_MB = 20 * 1024 * 1024;
@@ -684,16 +701,26 @@ export const processNormalizeSvg = async (job) => {
         }
 
         if (acquired) {
-          console.log('[AUTO_RENDER_TRIGGER]', { documentId, ts: Date.now() });
-          const serveKey = await resolveFinalPdfKeyForServe(documentId);
-          console.log('[AUTO_RENDER_ENQUEUED]', { documentId, key: serveKey, ts: Date.now() });
+          const svgSizeMbSafe =
+            Number.isFinite(svgSizeMb) ? Math.round(svgSizeMb * 100) / 100 : null;
 
-          const bucket = String(process.env.AWS_S3_BUCKET || '').trim();
-          if (bucket) {
-            try {
-              await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: serveKey }));
-            } catch {
-              // ignore
+          if (svgSizeMbSafe !== null && svgSizeMbSafe > 10) {
+            console.log('[AUTO_RENDER_SKIPPED_LARGE_SVG]', {
+              documentId,
+              svgSizeMb: svgSizeMbSafe,
+            });
+          } else {
+            console.log('[AUTO_RENDER_TRIGGER]', { documentId, ts: Date.now() });
+            const serveKey = await resolveFinalPdfKeyForServe(documentId);
+            console.log('[AUTO_RENDER_ENQUEUED]', { documentId, key: serveKey, ts: Date.now() });
+
+            const bucket = String(process.env.AWS_S3_BUCKET || '').trim();
+            if (bucket) {
+              try {
+                await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: serveKey }));
+              } catch {
+                // ignore
+              }
             }
           }
         }
@@ -714,6 +741,7 @@ export const processNormalizeSvg = async (job) => {
       timeoutReject = reject;
 
       const check = () => {
+        if (timeoutCancelled) return;
         const elapsed = Date.now() - raceStartedAtMs;
         if (!softTimeoutWarned && elapsed >= SOFT_TIMEOUT_MS) {
           softTimeoutWarned = true;
@@ -722,14 +750,14 @@ export const processNormalizeSvg = async (job) => {
 
         if (elapsed >= HARD_TIMEOUT_MS) {
           if (inInkscape) {
-            setTimeout(check, 1000);
+            timeoutId = setTimeout(check, 1000);
             return;
           }
           reject(new Error('SVG_NORMALIZE_TIMEOUT'));
           return;
         }
 
-        setTimeout(check, 1000);
+        timeoutId = setTimeout(check, 1000);
       };
 
       timeoutId = setTimeout(() => {
@@ -793,6 +821,7 @@ export const processNormalizeSvg = async (job) => {
 
     throw err;
   } finally {
+    timeoutCancelled = true;
     if (timeoutId) {
       clearTimeout(timeoutId);
     }
@@ -1015,7 +1044,16 @@ const processMerge = async (job) => {
     }
 
     if (!batches.length) {
-      throw new Error('Missing rendered batches for merge');
+      const batchSize = Math.max(1, Math.min(50, Number(process.env.VECTOR_BATCH_SIZE || 50)));
+      const total = Number(jobDoc.totalPages || 1);
+      for (let startPage = 0; startPage < total; startPage += batchSize) {
+        const endPage = Math.min(total, startPage + batchSize);
+        batches.push({
+          batchKey: `documents/tmp/${printJobId}/batch-${Number(startPage)}-${Number(endPage)}.pdf`,
+          startPage: Number(startPage),
+          endPage: Number(endPage),
+        });
+      }
     }
 
     batches.sort((a, b) => a.startPage - b.startPage);
@@ -1030,6 +1068,8 @@ const processMerge = async (job) => {
       if (maxMergeMs > 0 && Date.now() - mergeStart > maxMergeMs) {
         throw new Error('Merge exceeded time budget');
       }
+
+      await waitForS3Key(String(b.batchKey), Number(process.env.VECTOR_S3_WAIT_TIMEOUT_MS || 30_000));
 
       const obj = await getObjectStreamFromS3(String(b.batchKey));
       if (!obj?.Body) throw new Error('Missing rendered batch');
