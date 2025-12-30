@@ -733,20 +733,41 @@ export class VectorLayoutEngine {
 
     // Embed ONLY the cropped region of the source page (vector-safe)
     // This avoids overwriting other slots when the source page has background artwork.
-    const embedBox = {
-      left: cropLeft,
-      bottom: cropBottom,
-      right: snap(cropLeft + cropWidth),
-      top: snap(cropBottom + cropHeight),
-    };
+    const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+    let left = Number(cropLeft);
+    let bottom = Number(cropBottom);
+    let right = Number(snap(cropLeft + cropWidth));
+    let top = Number(snap(cropBottom + cropHeight));
+
+    if (!Number.isFinite(left)) left = 0;
+    if (!Number.isFinite(bottom)) bottom = 0;
+    if (!Number.isFinite(right)) right = srcWidth;
+    if (!Number.isFinite(top)) top = srcHeight;
+
+    left = clamp(left, 0, srcWidth);
+    right = clamp(right, 0, srcWidth);
+    bottom = clamp(bottom, 0, srcHeight);
+    top = clamp(top, 0, srcHeight);
+
+    // If crop collapses/out-of-bounds (can happen due to rounding/unit mismatch), fall back to full page.
+    const cropValid = right - left > 0.5 && top - bottom > 0.5;
+    if (!cropValid) {
+      left = 0;
+      bottom = 0;
+      right = srcWidth;
+      top = srcHeight;
+    }
+
+    const embedBox = { left: snap(left), bottom: snap(bottom), right: snap(right), top: snap(top) };
 
     const embedded = await this.pdfDoc.embedPage(srcPage, embedBox);
 
     const renderBBox = {
       x: 0,
       y: 0,
-      width: cropWidth,
-      height: cropHeight,
+      width: snap(right - left),
+      height: snap(top - bottom),
     };
 
     const widthMm = this._finiteOrNull(ticketCrop?.widthMm);
