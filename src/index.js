@@ -34,6 +34,14 @@ app.use(express.urlencoded({ extended: true, limit: BODY_LIMIT }));
 /* -------------------------------- start ---------------------------------- */
 
 async function start() {
+  const version = process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || 'unknown';
+  console.log('[Build]', {
+    version,
+    railwayDeploymentId: process.env.RAILWAY_DEPLOYMENT_ID || null,
+    railwayServiceId: process.env.RAILWAY_SERVICE_ID || null,
+    railwayEnvironment: process.env.RAILWAY_ENVIRONMENT_NAME || null,
+  });
+
   const { default: bcrypt } = await import('bcryptjs');
   const { default: VectorUser } = await import('./vectorModels/VectorUser.js');
   const { default: authRoutes } = await import('./routes/auth.js');
