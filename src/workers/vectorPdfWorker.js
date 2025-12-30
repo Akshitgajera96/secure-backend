@@ -28,12 +28,14 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
 function buildHmacPayload(jobDoc) {
-  console.log('[DEBUG_BUILD_PAYLOAD]', {
-    jobId: jobDoc._id.toString(),
-    hasMetadata: !!jobDoc.metadata,
-    metadataKeys: jobDoc.metadata ? Object.keys(jobDoc.metadata) : [],
-    createdAt: jobDoc.createdAt?.toISOString(),
-  });
+  if (DIAG_BULLMQ) {
+    console.log('[DEBUG_BUILD_PAYLOAD]', {
+      jobId: jobDoc._id.toString(),
+      hasMetadata: !!jobDoc.metadata,
+      metadataKeys: jobDoc.metadata ? Object.keys(jobDoc.metadata) : [],
+      createdAt: jobDoc.createdAt?.toISOString(),
+    });
+  }
   
   return {
     jobId: jobDoc._id.toString(),
@@ -894,6 +896,17 @@ const processPage = async (job) => {
 
   const t0 = Date.now();
 
+  // NOTE: Page-level jobs are intentionally disabled for performance.
+  // The standard pipeline uses batch jobs which reuse a compiled base layout.
+  // Keeping this function avoids breaking legacy job graphs.
+  await updateProgress(jobDoc, Math.max(jobDoc.progress, 0), 'PAGE_JOB_SKIPPED', {
+    pageIndex,
+    reason: 'BATCH_ONLY_PIPELINE',
+  });
+  jobDoc.audit.push({ event: 'PAGE_RENDER_SKIPPED', details: { pageIndex, ms: Date.now() - t0 } });
+  await jobDoc.save();
+  return { skipped: true, pageIndex };
+
 // ...
 
   if (!jobDoc.payloadHmac) {
@@ -1030,6 +1043,236 @@ const processPage = async (job) => {
 
     const mergeMs = Date.now() - mergeStart;
 
+    const finalBytes = await mergedDoc.save();
+
+    const finalKey =
+      (jobDoc?.metadata && typeof jobDoc.metadata.outputKey === 'string' && jobDoc.metadata.outputKey.trim())
+        ? jobDoc.metadata.outputKey.trim()
+        : `documents/final/${printJobId}.pdf`;
+
+    console.log(
+      JSON.stringify({
+        phase: 'upload',
+        event: 'VECTOR_UPLOAD_STARTED',
+        documentId,
+        jobId: String(printJobId),
+      })
+    );
+
+    const { key, url } = await uploadToS3WithKey(Buffer.from(finalBytes), 'application/pdf', finalKey);
+
+    const ttlHours = Number(process.env.FINAL_PDF_TTL_HOURS || 24);
+    const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000);
+
+    jobDoc.status = 'DONE';
+    jobDoc.progress = 100;
+    jobDoc.output = { key, url, expiresAt };
+    jobDoc.audit.push({ event: 'JOB_DONE', details: { key } });
+    jobDoc.audit.push({ event: 'MERGE_TIME', details: { ms: mergeMs } });
+    await jobDoc.save();
+
+    console.log(
+      JSON.stringify({
+        phase: 'merge',
+        event: 'VECTOR_MERGE_DONE',
+        documentId,
+        jobId: String(printJobId),
+        ms: Date.now() - mergeStart,
+      })
+    );
+
+    await releaseRenderLock({ documentId, printJobId: String(printJobId) });
+    console.log('[MERGE_PDFLIB_DONE]', { printJobId, mergedPages: Number(jobDoc.totalPages || 1) });
+    return { ok: true, key };
+  } catch (e) {
+    await releaseRenderLock({ documentId, printJobId: String(printJobId) });
+    throw e;
+  }
+};
+
+const processBatch = async (job) => {
+  const { printJobId, startPage, endPage, totalPages } = job.data || {};
+
+  const batchStart = Date.now();
+
+  const jobDoc = await VectorPrintJob.findById(printJobId).exec();
+  if (!jobDoc) {
+    throw new Error('PrintJob not found');
+  }
+
+  if (jobDoc.status === 'EXPIRED') {
+    return { skipped: true };
+  }
+
+  const validation = validateVectorMetadata(jobDoc.metadata);
+  if (!validation.isValid) {
+    throw new Error('Invalid vector metadata');
+  }
+
+  if (!jobDoc.payloadHmac) {
+    throw new Error('payloadHmac missing on job');
+  }
+
+  verifyJobSignature(jobDoc, 'BATCH');
+
+  const base = await ensureBaseLayout(jobDoc, String(printJobId));
+
+  await waitForS3Key(String(base.s3Key), Number(process.env.VECTOR_S3_WAIT_TIMEOUT_MS || 30_000));
+  const baseObj = await getObjectStreamFromS3(base.s3Key);
+  if (!baseObj?.Body) throw new Error('Missing base layout');
+  const baseBytes = await streamToBuffer(baseObj.Body);
+
+  const { PDFDocument } = await import('pdf-lib');
+  const basePdf = await PDFDocument.load(baseBytes);
+
+  const batchPdf = await PDFDocument.create();
+  vectorLayoutEngine.pdfDoc = batchPdf;
+  vectorLayoutEngine.embeddedFonts.clear();
+  vectorLayoutEngine._seriesPipelineFinalLogged = false;
+  vectorLayoutEngine._alignmentFlowLogged = false;
+
+  console.log('[PAGE_RENDER_LOOP_START]', { printJobId, startPage, endPage });
+
+  for (let pageIndex = Number(startPage); pageIndex < Number(endPage); pageIndex += 1) {
+    const [p] = await batchPdf.copyPages(basePdf, [0]);
+    batchPdf.addPage(p);
+
+    await vectorLayoutEngine.drawSeriesNumbers(
+      p,
+      jobDoc.metadata.series,
+      pageIndex,
+      Number(base.meta.repeatPerPage),
+      base.meta.slotPlacements
+    );
+
+    const rendered = Math.min(
+      Math.max(0, pageIndex + 1),
+      Number(totalPages || jobDoc.totalPages || 1)
+    );
+    const pct = Math.floor((rendered / Math.max(1, Number(totalPages || jobDoc.totalPages || 1))) * 80);
+    await updateProgress(jobDoc, Math.max(jobDoc.progress, pct), 'PAGE_RENDERED', { pageIndex });
+  }
+
+  console.log('[PAGE_RENDER_LOOP_END]', { printJobId, startPage, endPage });
+
+  const batchBytes = await batchPdf.save();
+  const header = Buffer.from(batchBytes.slice(0, 5)).toString();
+  if (!header.startsWith('%PDF-')) {
+    throw new Error('SECURITY VIOLATION: Output is not a valid PDF. Vector pipeline broken.');
+  }
+
+  const batchKey = `documents/tmp/${printJobId}/batch-${Number(startPage)}-${Number(endPage)}.pdf`;
+  const uploaded = await uploadToS3WithKey(Buffer.from(batchBytes), 'application/pdf', batchKey);
+
+  const documentId = String(
+    jobDoc?.metadata?.documentId || jobDoc?.metadata?.sourcePdfKey || jobDoc?.sourcePdfKey || ''
+  ).trim();
+  console.log(
+    JSON.stringify({
+      phase: 'render',
+      event: 'VECTOR_BATCH_DONE',
+      documentId,
+      jobId: String(printJobId),
+      ms: Date.now() - batchStart,
+    })
+  );
+
+  return { batchKey: uploaded.key, startPage: Number(startPage), endPage: Number(endPage) };
+};
+
+const processMerge = async (job) => {
+  const { printJobId } = job.data || {};
+
+  const jobDoc = await VectorPrintJob.findById(printJobId).exec();
+  if (!jobDoc) {
+    throw new Error('PrintJob not found');
+  }
+
+  if (jobDoc.status === 'EXPIRED') {
+    return { skipped: true };
+  }
+
+  if (!jobDoc.payloadHmac) {
+    throw new Error('payloadHmac missing on job');
+  }
+
+  verifyJobSignature(jobDoc, 'MERGE');
+
+  const documentId = String(jobDoc?.metadata?.documentId || jobDoc?.metadata?.sourcePdfKey || jobDoc?.sourcePdfKey || '').trim();
+  const mergeStart = Date.now();
+  const maxMergeMs = Math.max(0, Number(process.env.VECTOR_MERGE_MAX_MS || 0));
+
+  console.log(
+    JSON.stringify({
+      phase: 'merge',
+      event: 'VECTOR_MERGE_STARTED',
+      documentId,
+      jobId: String(printJobId),
+      totalPages: Number(jobDoc.totalPages || 1),
+    })
+  );
+
+  try {
+    jobDoc.status = 'RUNNING';
+    await updateProgress(jobDoc, Math.max(jobDoc.progress, 80), 'MERGE_JOB_STARTED', null);
+
+    const childrenValues = await job.getChildrenValues();
+    const batches = [];
+
+    for (const value of Object.values(childrenValues)) {
+      const v = typeof value === 'string' ? JSON.parse(value) : value;
+      if (v && v.batchKey && Number.isFinite(Number(v.startPage)) && Number.isFinite(Number(v.endPage))) {
+        batches.push({
+          batchKey: String(v.batchKey),
+          startPage: Number(v.startPage),
+          endPage: Number(v.endPage),
+        });
+      }
+    }
+
+    if (!batches.length) {
+      const batchSize = Math.max(1, Math.min(50, Number(process.env.VECTOR_BATCH_SIZE || 50)));
+      const total = Number(jobDoc.totalPages || 1);
+      for (let startPage = 0; startPage < total; startPage += batchSize) {
+        const endPage = Math.min(total, startPage + batchSize);
+        batches.push({
+          batchKey: `documents/tmp/${printJobId}/batch-${Number(startPage)}-${Number(endPage)}.pdf`,
+          startPage: Number(startPage),
+          endPage: Number(endPage),
+        });
+      }
+    }
+
+    batches.sort((a, b) => a.startPage - b.startPage);
+
+    const { PDFDocument } = await import('pdf-lib');
+    const mergedDoc = await PDFDocument.create();
+
+    console.log('[MERGE_PDFLIB_START]', { printJobId, batches: batches.length });
+
+    let mergedPages = 0;
+    for (const b of batches) {
+      if (maxMergeMs > 0 && Date.now() - mergeStart > maxMergeMs) {
+        throw new Error('Merge exceeded time budget');
+      }
+
+      await waitForS3Key(String(b.batchKey), Number(process.env.VECTOR_S3_WAIT_TIMEOUT_MS || 30_000));
+
+      const obj = await getObjectStreamFromS3(String(b.batchKey));
+      if (!obj?.Body) throw new Error('Missing rendered batch');
+      const bytes = await streamToBuffer(obj.Body);
+      const pdf = await PDFDocument.load(bytes);
+      const pages = await mergedDoc.copyPages(pdf, pdf.getPageIndices());
+      pages.forEach((p) => mergedDoc.addPage(p));
+      mergedPages += pages.length;
+
+      const pct = 80 + Math.floor((mergedPages / Math.max(1, Number(jobDoc.totalPages || 1))) * 15);
+      await updateProgress(jobDoc, Math.max(jobDoc.progress, pct), 'MERGE_PROGRESS', { mergedPages });
+    }
+
+    await updateProgress(jobDoc, Math.max(jobDoc.progress, 95), 'FINAL_MERGE_DONE', null);
+
+    const mergeMs = Date.now() - mergeStart;
     const finalBytes = await mergedDoc.save();
 
     const finalKey =
