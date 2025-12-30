@@ -273,7 +273,14 @@ router.post('/print/request', authMiddleware, async (req, res) => {
 
     const doc = await VectorDocument.findById(docId).select('title').exec();
 
-    const sourceKey = await resolveFinalPdfKeyForServe(docId);
+   const sourceKey = await resolveFinalPdfKeyForServe(docId);
+
+   if (!sourceKey || !sourceKey.toLowerCase().endsWith('.pdf')) {
+   return res.status(409).json({
+    message: 'PDF not ready yet. Please wait for generation to complete.',
+    });
+   }
+
 
     const issuedAtIso = new Date().toISOString();
     const serial = crypto.randomUUID();
