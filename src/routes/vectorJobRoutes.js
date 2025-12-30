@@ -4,7 +4,7 @@ import VectorPrintJob from '../vectorModels/VectorPrintJob.js';
 import { validateVectorMetadata } from '../vector/validation.js';
 import { assertVectorJobEnqueueable, VectorJobValidationError } from '../vector/hardeningValidation.js';
 import crypto from 'crypto';
-import { buildCanonicalJobPayload, signJobPayload } from '../services/hmac.js';
+import { buildCanonicalJobPayload, signJobHmacPayload } from '../services/hmac.js';
 import { enqueueVectorJobFlow } from '../workers/vectorPdfWorker.js';
 import { getRedisClient } from '../services/redisClient.js';
 import { s3 } from '../services/s3.js';
@@ -158,11 +158,13 @@ router.post('/jobs', authMiddleware, requireAdmin, async (req, res) => {
       metadata.outputKey = `documents/generated/${userId}/${jobId}.pdf`;
     }
 
-    const payloadHmac = signJobPayload(metadata);
-
     const totalPages = Number(metadata?.layout?.totalPages || 1);
 
-    const printJobId = (req._vectorPreallocatedJobId && String(req._vectorPreallocatedJobId)) || undefined;
+    const printJobId =
+      (req._vectorPreallocatedJobId && String(req._vectorPreallocatedJobId)) || new VectorPrintJob()._id.toString();
+
+    const createdAt = new Date();
+    const payloadHmac = signJobHmacPayload({ jobId: String(printJobId), createdAt: createdAt.toISOString() });
 
     const jobDoc = await VectorPrintJob.create({
       _id: printJobId,
@@ -173,6 +175,7 @@ router.post('/jobs', authMiddleware, requireAdmin, async (req, res) => {
       status: 'PENDING',
       progress: 0,
       totalPages,
+      createdAt,
       audit: [{ event: 'JOB_CREATED', details: { totalPages } }],
     });
 
@@ -267,7 +270,7 @@ router.get('/jobs/:jobId/result', authMiddleware, requireAdmin, async (req, res)
 
   const outputKey = jobDoc.output.key;
   const command = new GetObjectCommand({ Bucket: bucket, Key: outputKey });
-  const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 });
+  const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 10 });
   return res.json({ fileUrl: signedUrl, expiresAt: jobDoc.output.expiresAt, key: outputKey });
 });
 
