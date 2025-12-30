@@ -85,7 +85,6 @@ export function verifyJobHmacPayload(payload, expectedHmac) {
 
   const canonical = {
     jobId: String(payload?.jobId || ''),
-    outputKey: String(payload?.outputKey || ''),
     createdAt: String(payload?.createdAt || ''),
   };
 
