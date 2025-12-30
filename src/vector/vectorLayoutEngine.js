@@ -770,6 +770,22 @@ export class VectorLayoutEngine {
       height: snap(top - bottom),
     };
 
+    const safeNumber = (v, fallback) => (Number.isFinite(Number(v)) ? Number(v) : fallback);
+    const clampPage = (v, min, max) => Math.min(max, Math.max(min, v));
+    const safeOrigin = (origin) => {
+      const x = safeNumber(origin?.x, 0);
+      const y = safeNumber(origin?.y, 0);
+      return {
+        x: snap(clampPage(x, -A4_WIDTH * 2, A4_WIDTH * 2)),
+        y: snap(clampPage(y, -A4_HEIGHT * 2, A4_HEIGHT * 2)),
+      };
+    };
+    const safeScale = (s) => {
+      const n = safeNumber(s, 1);
+      // Prevent invisible draw due to near-zero scale; cap huge scales too.
+      return snap(clampPage(n, 0.0005, 1000));
+    };
+
     const widthMm = this._finiteOrNull(ticketCrop?.widthMm);
     const heightMm = this._finiteOrNull(ticketCrop?.heightMm);
     const xMm = this._finiteOrNull(ticketCrop?.xMm);
@@ -910,7 +926,7 @@ export class VectorLayoutEngine {
         const drawX = snap(x);
         const drawY = snap(A4_HEIGHT - this.mmToPt(objYmm) - finalHeightPt);
 
-        const calibratedOrigin = coordinateConverter.applyCalibration(drawX, drawY, this.calibration);
+        const calibratedOrigin = safeOrigin(coordinateConverter.applyCalibration(drawX, drawY, this.calibration));
 
         const rot = Number.isFinite(rotationDeg) ? Number(rotationDeg) : 0;
         if (rot) {
@@ -942,8 +958,8 @@ export class VectorLayoutEngine {
           page.drawPage(embedded, {
             x: snap(calibratedOrigin.x),
             y: snap(calibratedOrigin.y),
-            xScale: slotScaleX,
-            yScale: slotScaleY,
+            xScale: safeScale(slotScaleX),
+            yScale: safeScale(slotScaleY),
           });
         }
 
@@ -1026,10 +1042,10 @@ export class VectorLayoutEngine {
 
       const calibratedOrigin = coordinateConverter.applyCalibration(drawX, drawY, this.calibration);
       page.drawPage(embedded, {
-        x: snap(calibratedOrigin.x),
-        y: snap(calibratedOrigin.y),
-        xScale: slotScale,
-        yScale: slotScale,
+        x: snap(safeOrigin(calibratedOrigin).x),
+        y: snap(safeOrigin(calibratedOrigin).y),
+        xScale: safeScale(slotScale),
+        yScale: safeScale(slotScale),
       });
 
       if (_pageIdx === 0) {
