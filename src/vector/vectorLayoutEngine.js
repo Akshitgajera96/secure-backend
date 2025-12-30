@@ -307,6 +307,7 @@ const inkscapeSvgToPdfBytes = async (svgContent, options = null) => {
   const inputSvgPath = path.join(tmpDir, 'input.svg');
   const plainSvgPath = path.join(tmpDir, 'plain.svg');
   const outputPdfPath = path.join(tmpDir, 'output.pdf');
+  const outputPngPath = path.join(tmpDir, 'output.png');
 
   try {
     const documentId = options && typeof options.documentId === 'string' ? options.documentId : null;
@@ -374,7 +375,58 @@ const inkscapeSvgToPdfBytes = async (svgContent, options = null) => {
     ]);
 
     const durationMs = Date.now() - t0;
-    const pdfBytes = await fs.readFile(outputPdfPath);
+    let pdfBytes = await fs.readFile(outputPdfPath);
+
+    const MIN_REASONABLE_PDF_BYTES = 20 * 1024;
+    if (pdfBytes.length < MIN_REASONABLE_PDF_BYTES) {
+      // Some Inkscape builds can emit an almost-empty PDF in headless mode.
+      // Retry with alternate flags, then fall back to PNG->PDF.
+      console.warn('[INKSCAPE_TINY_PDF_RETRY]', { documentId, inputBytes, outputBytes: pdfBytes.length });
+
+      try {
+        await runInkscape([
+          plainSvgPath,
+          '--export-type=pdf',
+          '--export-area-drawing',
+          '--export-dpi=300',
+          '--export-text-to-path=false',
+          `--export-filename=${outputPdfPath}`,
+        ]);
+        pdfBytes = await fs.readFile(outputPdfPath);
+      } catch {
+        // ignore
+      }
+    }
+
+    if (pdfBytes.length < MIN_REASONABLE_PDF_BYTES) {
+      console.warn('[INKSCAPE_TINY_PDF_FALLBACK_PNG]', { documentId, inputBytes, outputBytes: pdfBytes.length });
+      await runInkscape([
+        plainSvgPath,
+        '--export-type=png',
+        '--export-area-page',
+        '--export-dpi=300',
+        `--export-filename=${outputPngPath}`,
+      ]);
+
+      const pngBytes = await fs.readFile(outputPngPath);
+      const pdfDoc = await PDFDocument.create();
+      const pngImage = await pdfDoc.embedPng(pngBytes);
+      const page = pdfDoc.addPage([A4_WIDTH, A4_HEIGHT]);
+
+      // Fit PNG to page.
+      const scale = Math.min(A4_WIDTH / pngImage.width, A4_HEIGHT / pngImage.height);
+      const w = pngImage.width * scale;
+      const h = pngImage.height * scale;
+      page.drawImage(pngImage, {
+        x: (A4_WIDTH - w) / 2,
+        y: (A4_HEIGHT - h) / 2,
+        width: w,
+        height: h,
+      });
+
+      pdfBytes = await pdfDoc.save();
+    }
+
     console.log('[INKSCAPE_DONE]', { documentId, inputBytes, outputBytes: pdfBytes.length, durationMs });
     return pdfBytes;
   } finally {
