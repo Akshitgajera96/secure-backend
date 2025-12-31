@@ -122,6 +122,8 @@ export const processNormalizeSvgInline = async ({ printJobId, documentId }) => {
   }
 
   const fakeJob = {
+    id: `inline:${id}`,
+    name: 'normalizeSvg',
     data: {
       printJobId: id,
       documentId: docId,
