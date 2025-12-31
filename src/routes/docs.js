@@ -16,7 +16,7 @@ import { authMiddleware } from '../middleware/auth.js';
 import { A4_WIDTH, A4_HEIGHT, SAFE_MARGIN } from '../vector/constants.js';
 import { assertAndConsumePrintQuota } from '../services/printQuotaService.js';
 import { resolveFinalPdfKeyForServe } from '../services/finalPdfExportService.js';
-import { buildCanonicalJobPayload, signJobPayload } from '../services/hmac.js';
+import { buildCanonicalJobPayload, signJobHmacPayload } from '../services/hmac.js';
 import { processNormalizeSvgInline } from '../workers/vectorPdfWorker.js';
 
 const router = express.Router();
@@ -73,23 +73,30 @@ router.post('/:documentId/generate', authMiddleware, async (req, res) => {
       placementRules: placement,
       outputKey: renderKey,
     };
-    const payloadHmac = signJobPayload(payload);
 
-    const jobDoc = await VectorPrintJob.create({
+    const createdAt = new Date();
+    const jobDoc = new VectorPrintJob({
       userId: req.user._id,
       sourcePdfKey: renderKey,
       metadata: payload,
-      payloadHmac,
+      payloadHmac: 'pending',
       status: 'PENDING',
       progress: 0,
       totalPages: 1,
       audit: [{ event: 'SVG_NORMALIZE_JOB_CREATED', details: { documentId: doc._id.toString() } }],
+      createdAt,
     });
+
+    jobDoc.payloadHmac = signJobHmacPayload({
+      jobId: jobDoc._id.toString(),
+      createdAt: createdAt.toISOString(),
+    });
+    await jobDoc.save();
 
     console.log('[HMAC_SIGN]', {
       jobId: jobDoc._id.toString(),
       payload: buildCanonicalJobPayload(payload),
-      hmac: payloadHmac.slice(0, 8),
+      hmac: jobDoc.payloadHmac.slice(0, 8),
     });
     await Document.updateOne(
       { _id: doc._id },
@@ -709,6 +716,12 @@ router.post('/secure-render', authMiddleware, async (req, res) => {
       return res.status(409).json({ status: 'not_ready', message: 'PDF not ready yet' });
     }
 
+    const accept = String(req.headers.accept || '').toLowerCase();
+    const wantsJson =
+      (typeof req.query?.mode === 'string' && req.query.mode.toLowerCase() === 'url') ||
+      (typeof req.query?.format === 'string' && req.query.format.toLowerCase() === 'json') ||
+      accept.includes('application/json');
+
     const incomingRequestId =
       (typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id'].trim())
         ? String(req.headers['x-request-id']).trim()
@@ -716,14 +729,38 @@ router.post('/secure-render', authMiddleware, async (req, res) => {
           ? requestId.trim()
           : crypto.randomUUID();
 
-    await assertAndConsumePrintQuota(doc._id.toString(), req.user._id.toString(), incomingRequestId);
-
     const bucket = process.env.AWS_S3_BUCKET;
     if (!bucket) {
       return res.status(500).json({ message: 'S3 not configured' });
     }
 
     const serveKey = await resolveFinalPdfKeyForServe(doc._id.toString());
+
+    if (wantsJson) {
+      const command = new GetObjectCommand({
+        Bucket: bucket,
+        Key: serveKey,
+      });
+
+      const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 });
+
+      const quotaRaw =
+        Number.isFinite(access?.printQuota) && access.printQuota !== null
+          ? Number(access.printQuota)
+          : Number(access?.assignedQuota || 0);
+      const usedRaw = Math.max(
+        Number.isFinite(access?.printsUsed) ? Number(access.printsUsed) : 0,
+        Number.isFinite(access?.usedPrints) ? Number(access.usedPrints) : 0
+      );
+
+      return res.json({
+        fileUrl: signedUrl,
+        key: serveKey,
+        remainingPrints: Math.max(0, quotaRaw - usedRaw),
+        maxPrints: quotaRaw,
+        requestId: incomingRequestId,
+      });
+    }
 
     console.log(
       JSON.stringify({
