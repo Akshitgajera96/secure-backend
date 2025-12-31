@@ -1,5 +1,7 @@
 import crypto from 'crypto';
 
+const isHmacDisabled = () => String(process.env.DISABLE_JOB_HMAC || '') === 'true';
+
 const stableStringify = (value) => {
   if (value === null || value === undefined) return JSON.stringify(value);
   if (typeof value !== 'object') return JSON.stringify(value);
@@ -29,6 +31,9 @@ export function buildCanonicalJobPayload(metadata) {
 }
 
 export function signJobPayload(metadata) {
+  if (isHmacDisabled()) {
+    return crypto.randomBytes(32).toString('hex');
+  }
   const secret = process.env.JOB_PAYLOAD_HMAC_SECRET;
   if (!secret) {
     throw new Error('JOB_PAYLOAD_HMAC_SECRET not configured');
@@ -41,6 +46,7 @@ export function signJobPayload(metadata) {
 }
 
 export function verifyJobPayload(metadata, expectedHmac) {
+  if (isHmacDisabled()) return true;
   if (typeof expectedHmac !== 'string' || !expectedHmac) return false;
 
   const secret = process.env.JOB_PAYLOAD_HMAC_SECRET;
@@ -53,14 +59,17 @@ export function verifyJobPayload(metadata, expectedHmac) {
 
   const actualHmac = crypto.createHmac('sha256', secret).update(payloadString).digest('hex');
 
-  const a = Buffer.from(actualHmac);
-  const b = Buffer.from(expectedHmac);
+  const a = Buffer.from(actualHmac, 'hex');
+  const b = Buffer.from(expectedHmac, 'hex');
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
 
 // Job-level HMAC helpers (immutable payload: { jobId, outputKey, createdAt })
 export function signJobHmacPayload(payload) {
+  if (isHmacDisabled()) {
+    return crypto.randomBytes(32).toString('hex');
+  }
   const secret = process.env.JOB_PAYLOAD_HMAC_SECRET;
   if (!secret) {
     throw new Error('JOB_PAYLOAD_HMAC_SECRET not configured');
@@ -76,6 +85,7 @@ export function signJobHmacPayload(payload) {
 }
 
 export function verifyJobHmacPayload(payload, expectedHmac) {
+  if (isHmacDisabled()) return true;
   if (typeof expectedHmac !== 'string' || !expectedHmac) return false;
 
   const secret = process.env.JOB_PAYLOAD_HMAC_SECRET;
