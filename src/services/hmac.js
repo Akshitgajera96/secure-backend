@@ -101,8 +101,8 @@ export function verifyJobHmacPayload(payload, expectedHmac) {
   const payloadString = stableStringify(canonical);
   const actualHmac = crypto.createHmac('sha256', secret).update(payloadString).digest('hex');
 
-  const a = Buffer.from(actualHmac);
-  const b = Buffer.from(expectedHmac);
+  const a = Buffer.from(actualHmac, 'hex');
+  const b = Buffer.from(expectedHmac, 'hex');
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
 }
