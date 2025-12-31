@@ -273,8 +273,16 @@ router.get('/jobs/:jobId/result', authMiddleware, requireAdmin, async (req, res)
   }
 
   const outputKey = jobDoc.output.key;
-  const command = new GetObjectCommand({ Bucket: bucket, Key: outputKey });
-  const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 10 });
+  const command = new GetObjectCommand({
+    Bucket: bucket,
+    Key: outputKey,
+    ResponseContentType: 'application/pdf',
+    ResponseContentDisposition: 'inline',
+  });
+
+  const ttlSecondsRaw = Number(process.env.VECTOR_RESULT_URL_TTL_SECONDS || 60 * 60);
+  const ttlSeconds = Math.max(60, Math.min(24 * 60 * 60, Number.isFinite(ttlSecondsRaw) ? ttlSecondsRaw : 60 * 60));
+  const signedUrl = await getSignedUrl(s3, command, { expiresIn: ttlSeconds });
   return res.json({ fileUrl: signedUrl, expiresAt: jobDoc.output.expiresAt, key: outputKey });
 });
 
