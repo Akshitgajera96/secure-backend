@@ -637,7 +637,8 @@ export const processNormalizeSvg = async (job) => {
         durationMs: metricsDurationMs,
       });
 
-      if (Number(metrics.pointCount) > Number(SVG_LIMITS.MAX)) {
+      const disableComplexityLimit = String(process.env.SVG_DISABLE_COMPLEXITY_LIMIT || '') === 'true';
+      if (!disableComplexityLimit && Number(metrics.pointCount) > Number(SVG_LIMITS.MAX)) {
         console.log('[SVG_REJECTED_TOO_COMPLEX]', {
           documentId,
           pointCount: metrics.pointCount,
