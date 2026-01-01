@@ -1137,7 +1137,19 @@ export const startVectorPdfWorkers = () => {
   if (DIAG_BULLMQ) {
     console.log('[QUEUE_NAME][WORKER]', VECTOR_PDF_QUEUE_NAME);
     try {
-      console.log('[REDIS_CONN][WORKER]', connection?.options);
+      const opts = connection?.options || null;
+      if (!opts || typeof opts !== 'object') {
+        console.log('[REDIS_CONN][WORKER]', opts);
+      } else {
+        const safeOpts = {
+          ...opts,
+          password: opts?.password ? '***' : opts?.password,
+          username: opts?.username || undefined,
+          host: opts?.host || undefined,
+          port: opts?.port || undefined,
+        };
+        console.log('[REDIS_CONN][WORKER]', safeOpts);
+      }
     } catch {
       console.log('[REDIS_CONN][WORKER]', null);
     }
